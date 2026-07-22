@@ -30,7 +30,22 @@ export default function (pi: ExtensionAPI) {
     paneStarted = true;
     try {
       await writeFile(logFile, `═══ pi bash transcript · pid ${id} · ${new Date().toLocaleTimeString()} ═══\n`);
-      // Prefer pi-terminal-mux (honors the install); fall back to raw zellij.
+      // Zellij: create the mirror pane IN PI'S OWN TAB. pi-terminal-mux's placement
+      // heuristic opens a *brand-new tab* whenever pi's pane is too small to split
+      // (below PI_SUBAGENT_ZELLIJ_MIN_COLUMNS/ROWS), dumping the transcript somewhere
+      // unexpected. `new-pane --in-place` anchors to pi's pane (ZELLIJ_PANE_ID) and
+      // splits it, so the mirror always lives beside pi instead of spawning a tab.
+      if (process.env.ZELLIJ_PANE_ID) {
+        const zellijOut = execSync(
+          `zellij action new-pane --in-place --name "${paneName}" -- bash -c 'tail -f --retry "${logFile}"'`,
+          { stdio: ["ignore", "pipe", "ignore"] },
+        ).toString();
+        // new-pane prints the created pane id (e.g. "terminal_28"); remember it so
+        // cleanup closes THIS pane, not whatever pane happens to be focused.
+        paneId = (zellijOut.trim().match(/terminal_\d+|plugin_\d+|\d+/) ?? [])[0];
+        return;
+      }
+      // Non-zellij multiplexers: prefer pi-terminal-mux (honors the install).
       try {
         mux = await import("pi-terminal-mux");
         if (mux?.isMuxAvailable?.()) {
@@ -39,14 +54,12 @@ export default function (pi: ExtensionAPI) {
           return;
         }
       } catch {
-        /* pi-terminal-mux not resolvable from this extension — use zellij */
+        /* pi-terminal-mux not resolvable from this extension — use raw zellij */
       }
       const out = execSync(
         `zellij action new-pane --name "${paneName}" -- bash -c 'tail -f --retry "${logFile}"'`,
         { stdio: ["ignore", "pipe", "ignore"] },
       ).toString();
-      // new-pane prints the created pane id (e.g. "terminal_28"); remember it so
-      // cleanup closes THIS pane, not whatever pane happens to be focused.
       paneId = (out.trim().match(/terminal_\d+|plugin_\d+|\d+/) ?? [])[0];
     } catch {
       /* pane creation failed — transcript disabled, pi keeps working normally */

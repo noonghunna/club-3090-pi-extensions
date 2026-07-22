@@ -112,6 +112,12 @@ Passive visibility: keeps one persistent pane (`pi-mux-<pid>`) running
 plus the (truncated) output on each result. **Read-only mirror** — commands are
 not re-executed, so there are no side effects.
 
+In zellij the mirror pane is created with `new-pane --in-place`, anchored to pi's
+own pane (`ZELLIJ_PANE_ID`), so it always splits pi's tab and stays beside the
+conversation — it never spawns a separate tab. (pi-terminal-mux's default
+placement opens a *new tab* whenever pi's pane is too small to split, which is
+what this avoids.)
+
 This one is always-on once installed. If you only want the opt-in `zellij_job`
 tool, disable `mux-transcript` with `pi config` (toggle the extension off).
 
