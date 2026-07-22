@@ -100,6 +100,19 @@ It's a no-op for any other model/provider (only fires when those ratelimit heade
 are present), so it's safe to leave on everywhere. Handy for keeping an eye on
 hosted-Qwen rate limits during long bench runs.
 
+### `graceful-429` — visible 429 rate-limit countdown
+
+Passive UX layer over pi's built-in transient-error retry (settings `retry.*`): when a
+provider returns **HTTP 429**, it shows a live countdown in the footer statusline —
+`⏳ rate-limited (429) — retrying in ~Ns · #N this session` — plus a one-time notification,
+and clears it when the retry lands (with a safety-net clear on `agent_end`). It reads the
+server's `Retry-After` for an accurate countdown, falling back to pi's backoff estimate.
+
+It doesn't change the retry behavior itself — tune that in `settings.json`
+(`retry.maxRetries`, `retry.baseDelayMs`, `retry.provider.maxRetryDelayMs`). Generic —
+fires on any provider's 429, so a throttled turn reads as "waiting on the rate limit"
+rather than "hung."
+
 ## Adding a new extension
 
 1. Drop a `.ts` file in `extensions/` exporting `default function (pi: ExtensionAPI) { … }`.
