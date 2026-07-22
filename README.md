@@ -83,6 +83,28 @@ List my Pi-owned zellij jobs and close the completed ones.
 - `send`/`interrupt` target the pane by `--pane-id` (`write-chars` / `write 3`).
 - Output returned to the model is capped at 50 KB / 2000 lines.
 
+**Pane safety policies**
+
+Closing the wrong pane is destructive (it can kill your shell or Pi itself), so
+`zellij_job` is conservative about the pane lifecycle:
+
+- **ID-targeted, never focus-based.** Every pane mutation uses
+  `zellij action <x> --pane-id <id>`. `close` runs `close-pane --pane-id <id>` —
+  it never does focus-then-close, which races and can destroy whatever happens to
+  be focused.
+- **Existence-checked + idempotent close.** `close` confirms the pane still
+  exists (`list-panes`) first; an already-gone pane is a no-op — not an error and
+  not a stray close.
+- **Session-scoped.** Each job records the zellij session it was created in. Pane
+  ids reset on a zellij restart and may be reused, so for a job from another
+  session `send`/`interrupt` refuse and `close` only drops the stale registry
+  entry — it never touches a possibly-reused pane.
+- **Running-job protection.** `close` refuses a launching/running job unless
+  `force=true` (then it SIGTERMs the process tree first).
+- **Open throttle.** At most 25 Pi-owned panes per session.
+- **`wait` never auto-closes.** Hitting the wait timeout returns `timedOut: true`
+  but leaves the pane open; closing is always an explicit `close`.
+
 ### `mux-transcript` — mirror every bash execution into a live pane
 
 Passive visibility: keeps one persistent pane (`pi-mux-<pid>`) running

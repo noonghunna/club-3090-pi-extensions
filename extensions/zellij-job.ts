@@ -19,6 +19,30 @@ import { resolve } from "node:path";
  * design, but drives `zellij action` instead of tmux and tracks jobs in a
  * jobs.json registry (zellij has no per-pane user-options). Requires Pi to be
  * running inside zellij.
+ *
+ * Pane lifecycle policies (guards against closing/acting on the wrong pane):
+ *
+ *  - Ownership: only panes recorded in jobs.json are ever managed. Every action
+ *    resolves its target through the registry first; a pane we did not create is
+ *    never touched.
+ *  - ID-targeted operations: all pane mutations use `zellij action <x> -p <paneId>`.
+ *    We NEVER focus-then-act — `close-pane`/`write` without `-p` operate on the
+ *    focused pane, which races and can hit the wrong pane (e.g. the user's shell
+ *    or Pi's own pane). This was a real bug; `-p` makes the operation atomic.
+ *  - Close is existence-checked + idempotent: we confirm the pane still exists
+ *    (via `list-panes`) before closing; an already-gone pane is a no-op, never an
+ *    error and never a stray close.
+ *  - Session scoping: each record stores the zellij session it was created in.
+ *    Pane IDs (terminal_N) reset on a zellij restart and may be reused, so for a
+ *    record from a different session we refuse to target the pane (send/interrupt
+ *    throw; close just drops the stale registry entry without touching any pane).
+ *  - Running-job protection: close refuses a launching/running job unless
+ *    force=true (then it SIGTERMs the process tree first).
+ *  - Open throttle: at most MAX_SESSION_PANES Pi-owned panes per session.
+ *  - Wait never auto-closes: hitting the wait timeout returns timedOut=true but
+ *    leaves the pane open; closing is always an explicit `close` action.
+ *  - Audit trail: each job dir keeps metadata.json, output.log, state, exit-code
+ *    and a `closed` marker.
  */
 
 interface ExecResult {
@@ -44,6 +68,7 @@ interface ZellijPaneJob {
   pid?: number;
   exitCode?: number;
   createdAt: string;
+  session?: string;
 }
 
 interface StartJobOptions {
@@ -61,9 +86,14 @@ interface JobRecord {
   cwd: string;
   pid?: number;
   createdAt: string;
+  session?: string;
 }
 
 const NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$/;
+
+// Maximum number of Pi-owned panes allowed in a single zellij session. Guards
+// against runaway pane creation; close some before opening more.
+const MAX_SESSION_PANES = 25;
 
 function assertSafeName(value: string): void {
   if (!NAME_PATTERN.test(value)) {
@@ -186,6 +216,45 @@ class ZellijJobManager {
     await rename(tmp, this.registryPath);
   }
 
+  private currentSession(): string {
+    return process.env.ZELLIJ_SESSION_NAME ?? "zellij";
+  }
+
+  private async listPaneIds(signal?: AbortSignal): Promise<Set<string>> {
+    const result = await this.exec("zellij", ["action", "list-panes"], { signal, timeout: 5000 });
+    const ids = new Set<string>();
+    if (result.code === 0) {
+      // Output: "PANE_ID  TYPE  TITLE" header, then one pane per line.
+      for (const line of result.stdout.split("\n").slice(1)) {
+        const id = line.trim().split(/\s+/)[0];
+        if (id) ids.add(id);
+      }
+    }
+    return ids;
+  }
+
+  private async paneExists(paneId: string, signal?: AbortSignal): Promise<boolean> {
+    return (await this.listPaneIds(signal)).has(paneId);
+  }
+
+  private async removeFromRegistry(id: string): Promise<void> {
+    const records = (await this.readRegistry()).filter((r) => r.id !== id);
+    await this.writeRegistry(records);
+  }
+
+  // Refuse to target a live pane that belongs to a different zellij session: its
+  // pane id may have been reused after a restart, so acting on it could hit the
+  // wrong pane. Used by send/interrupt; close handles staleness separately.
+  private assertLiveTarget(job: ZellijPaneJob): void {
+    const session = this.currentSession();
+    if (job.session !== undefined && job.session !== session) {
+      throw new Error(
+        `Job ${job.name} belongs to zellij session "${job.session}" but Pi is now in "${session}". ` +
+          "Pane IDs are not stable across zellij restarts; close the stale job to clean it up rather than targeting a possibly-reused pane.",
+      );
+    }
+  }
+
   private async enrich(record: JobRecord): Promise<ZellijPaneJob> {
     const state = (await readOptional(resolve(record.directory, "state"))) ?? "unknown";
     const rawExit = await readOptional(resolve(record.directory, "exit-code"));
@@ -200,6 +269,7 @@ class ZellijJobManager {
       pid: rawPid ? parseExitCode(rawPid) : record.pid,
       exitCode: rawExit === undefined ? undefined : parseExitCode(rawExit),
       createdAt: record.createdAt,
+      session: record.session,
     };
   }
 
@@ -222,11 +292,17 @@ class ZellijJobManager {
     const cwd = resolve(options.cwd);
     const cwdStat = await stat(cwd);
     if (!cwdStat.isDirectory()) throw new Error(`cwd is not a directory: ${cwd}`);
-    await this.ensureAvailable(options.signal);
+    const session = await this.ensureAvailable(options.signal);
 
     const existing = await this.readRegistry();
     if (existing.some((job) => job.name === options.name)) {
       throw new Error(`A zellij job named ${options.name} already exists; close it before reusing the name`);
+    }
+    const sessionPanes = existing.filter((j) => j.session === undefined || j.session === session).length;
+    if (sessionPanes >= MAX_SESSION_PANES) {
+      throw new Error(
+        `Refusing to open more than ${MAX_SESSION_PANES} Pi-owned zellij panes in session "${session}"; close some first`,
+      );
     }
 
     const id = `${options.name}-${Date.now().toString(36)}-${randomBytes(3).toString("hex")}`;
@@ -272,6 +348,7 @@ class ZellijJobManager {
       directory,
       cwd,
       createdAt: new Date().toISOString(),
+      session,
     };
     const records = await this.readRegistry();
     records.push(record);
@@ -305,6 +382,7 @@ class ZellijJobManager {
   async send(target: string, text: string, pressEnter: boolean, signal?: AbortSignal): Promise<ZellijPaneJob> {
     if (text.includes("\0")) throw new Error("text must not contain a NUL byte");
     const job = await this.requireJob(target, signal);
+    this.assertLiveTarget(job);
     const sent = await this.exec("zellij", ["action", "write-chars", "-p", job.paneId, text], { signal, timeout: 5000 });
     if (sent.code !== 0) throw new Error(`Unable to send text to ${job.paneId}: ${sent.stderr.trim()}`);
     if (pressEnter) {
@@ -316,6 +394,7 @@ class ZellijJobManager {
 
   async interrupt(target: string, signal?: AbortSignal): Promise<ZellijPaneJob> {
     const job = await this.requireJob(target, signal);
+    this.assertLiveTarget(job);
     // Ctrl-C is byte 3.
     const result = await this.exec("zellij", ["action", "write", "-p", job.paneId, "3"], { signal, timeout: 5000 });
     if (result.code !== 0) throw new Error(`Unable to interrupt ${job.paneId}: ${result.stderr.trim()}`);
@@ -327,19 +406,38 @@ class ZellijJobManager {
     if (["launching", "running"].includes(job.state) && !force) {
       throw new Error(`Refusing to close running job ${job.name}; interrupt it first or pass force=true`);
     }
-    // Kill the runner process tree if we have a pid, then close the pane.
+
+    const session = this.currentSession();
+    const stale = job.session !== undefined && job.session !== session;
+
+    if (stale) {
+      // Pane IDs are not stable across zellij restarts. Do NOT touch any pane —
+      // just drop the stale registry entry so it can never be acted on later.
+      await this.removeFromRegistry(job.id);
+      await writeFile(resolve(job.directory, "closed"), `${new Date().toISOString()} stale-session\n`, { mode: 0o600 }).catch(() => {});
+      return job;
+    }
+
+    // Graceful first: terminate the runner process tree (best-effort).
     if (job.pid) {
       await this.exec("bash", ["-c", `kill -TERM -- -${job.pid} 2>/dev/null || kill -TERM ${job.pid} 2>/dev/null || true`], {
         signal,
         timeout: 5000,
       });
     }
-    // close-pane only acts on the focused pane, so focus it first.
-    await this.exec("zellij", ["action", "focus-pane-id", job.paneId], { signal, timeout: 5000 });
-    await this.exec("zellij", ["action", "close-pane"], { signal, timeout: 5000 });
-    // Remove from registry.
-    const records = (await this.readRegistry()).filter((r) => r.id !== job.id);
-    await this.writeRegistry(records);
+
+    // Close the EXACT pane by ID. Never focus-then-close: `close-pane` without
+    // `-p` kills whatever is focused, which races and can destroy the wrong pane
+    // (the user's shell or Pi's own pane). `close-pane -p` is atomic and, if the
+    // pane is already gone, a safe no-op (we existence-check first for clarity).
+    if (await this.paneExists(job.paneId, signal)) {
+      const result = await this.exec("zellij", ["action", "close-pane", "-p", job.paneId], { signal, timeout: 5000 });
+      if (result.code !== 0) {
+        throw new Error(`Unable to close pane ${job.paneId}: ${result.stderr.trim() || result.stdout.trim()}`);
+      }
+    }
+
+    await this.removeFromRegistry(job.id);
     await writeFile(resolve(job.directory, "closed"), `${new Date().toISOString()}\n`, { mode: 0o600 }).catch(() => {});
     return job;
   }
