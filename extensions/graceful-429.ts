@@ -3,85 +3,103 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 /**
  * graceful-429 — make provider rate-limiting (HTTP 429) visible instead of scary.
  *
- * pi already retries transient errors automatically (settings.json `retry.*`:
- * retry.enabled, retry.maxRetries, retry.baseDelayMs, retry.provider.maxRetryDelayMs).
- * This extension does NOT change that — it surfaces it: when a 429 lands it shows a
- * live countdown in the footer statusline plus a one-time notification, and clears
- * it when the retry succeeds. A throttled turn reads as "waiting on the rate limit"
- * rather than "hung."
+ * pi already retries transient errors automatically (settings.json `retry.*`).
+ * This extension does NOT change that — it surfaces it in the footer statusline:
+ * a live "retrying · attempt N" indicator while pi is throttled, plus a one-time
+ * notification, and a brief "✓ cleared after N retries" when pi gets through.
  *
- * DETECTION (important): we hook `message_end` and match an assistant message whose
- * `errorMessage` carries a 429 / rate-limit signature. This is the reliable hook.
- * `after_provider_response` does NOT fire on 429 for OpenAI-SDK-based providers
- * (dashscope, openai, openrouter, …): the OpenAI SDK throws an APIError on a non-2xx
- * response *before* pi's onResponse callback runs (see pi-ai api/openai-completions.js
- * — onResponse is awaited only after `.withResponse()` resolves), so the 429 surfaces
- * solely as the assistant message's errorMessage. We still listen to
- * after_provider_response opportunistically to capture an accurate Retry-After on the
- * raw-fetch providers whose transport DOES surface it (pi-messages / anthropic).
+ * WHY NO FAKE COUNTDOWN: an earlier version estimated pi's backoff and ticked a
+ * countdown, but every 429 re-fires `message_end` and reset it — so it sat at a
+ * static "~4s" the whole time pi was retrying. For OpenAI-SDK providers
+ * (dashscope, openai, openrouter, …) there's also no Retry-After to read, because
+ * the SDK throws an APIError on the non-2xx response *before* pi's onResponse
+ * runs. So we only show a real countdown when a transport actually surfaces
+ * Retry-After (raw-fetch providers); otherwise we show the live attempt count,
+ * which genuinely progresses instead of pretending to a timer we don't have.
  *
- * Countdown delay = captured Retry-After when available, else an estimate of pi's
- * exponential backoff (retry.baseDelayMs, default → 2/4/8/16/32s).
- *
- * Generic — fires on any provider's 429.
+ * Detection hooks `message_end` and matches an assistant message whose
+ * `errorMessage` carries a 429 / rate-limit signature (the reliable hook for all
+ * providers). `after_provider_response` is used only to opportunistically capture
+ * an accurate Retry-After where the transport surfaces it.
  */
 export default function (pi: ExtensionAPI) {
   const STATUS_KEY = "graceful-429";
   const RATE_LIMIT_RE = /429|rate.?limit|too many requests|quota/i;
 
-  let ctxRef: ExtensionContext | undefined; // latest ctx, for the timer callback
+  let ctxRef: ExtensionContext | undefined; // latest ctx, for timer callbacks
   let countdownTimer: ReturnType<typeof setInterval> | undefined;
-  let rateLimitCount = 0; // total 429s this session (for the counter)
+  let clearTimer: ReturnType<typeof setTimeout> | undefined;
+  let burstCount = 0; // 429s in the current rate-limit burst
   let active = false; // currently showing a rate-limit indicator
   let pendingRetryAfter: number | undefined; // accurate Retry-After when a transport surfaced it
 
-  function clearCountdown() {
+  function clearTimers() {
     if (countdownTimer) {
       clearInterval(countdownTimer);
       countdownTimer = undefined;
     }
+    if (clearTimer) {
+      clearTimeout(clearTimer);
+      clearTimer = undefined;
+    }
   }
 
   function clearIndicator() {
-    clearCountdown();
+    clearTimers();
     if (active) {
       active = false;
       ctxRef?.ui.setStatus(STATUS_KEY, "");
     }
   }
 
-  function showRateLimited(waitSec: number) {
-    rateLimitCount += 1;
-    active = true;
-    let remaining = Math.max(1, Math.ceil(waitSec));
-
-    const render = () =>
-      ctxRef?.ui.setStatus(
-        STATUS_KEY,
-        `⏳ rate-limited (429) — retrying in ~${remaining}s · #${rateLimitCount} this session`,
-      );
-
-    render();
-    clearCountdown();
-    countdownTimer = setInterval(() => {
-      remaining -= 1;
-      if (remaining <= 0) {
-        // pi should be retrying about now; hold a "retrying…" note until the next
-        // message (success or final failure) clears it.
-        clearCountdown();
-        ctxRef?.ui.setStatus(
-          STATUS_KEY,
-          `⏳ rate-limited (429) — retrying… · #${rateLimitCount} this session`,
-        );
-      } else {
-        render();
-      }
-    }, 1000);
+  // pi got through: brief positive feedback, then clear.
+  function showRecovered(retries: number) {
+    if (!active) return;
+    clearTimers();
+    ctxRef?.ui.setStatus(
+      STATUS_KEY,
+      `✓ rate limit cleared${retries > 1 ? ` after ${retries} retries` : ""}`,
+    );
+    clearTimer = setTimeout(() => {
+      active = false;
+      ctxRef?.ui.setStatus(STATUS_KEY, "");
+    }, 4000);
   }
 
-  // Opportunistic: capture an accurate Retry-After on providers that surface the 429
-  // as an HTTP response. (The OpenAI-SDK path never reaches here on a 429 — it throws
-  // first — so for those this simply stays undefined and we estimate instead.)
+  function showRateLimited(waitSec: number | undefined, attempt: number) {
+    active = true;
+    clearTimers();
+
+    if (waitSec !== undefined && Number.isFinite(waitSec) && waitSec > 0) {
+      // Real Retry-After from the server: a live countdown to the next window is
+      // meaningful here (each 429 carries a fresh Retry-After, so resetting is ok).
+      let remaining = Math.max(1, Math.ceil(waitSec));
+      const render = () =>
+        ctxRef?.ui.setStatus(
+          STATUS_KEY,
+          `⏳ rate-limited (429) — retry in ~${remaining}s · attempt ${attempt}`,
+        );
+      render();
+      countdownTimer = setInterval(() => {
+        remaining -= 1;
+        if (remaining <= 0) {
+          clearTimers();
+          ctxRef?.ui.setStatus(STATUS_KEY, `⏳ rate-limited (429) — retrying… · attempt ${attempt}`);
+        } else {
+          render();
+        }
+      }, 1000);
+    } else {
+      // No reliable Retry-After (e.g. dashscope / OpenAI-SDK). Don't fake a timer
+      // that just resets on every 429 — show the attempt count, which actually
+      // progresses as pi retries.
+      ctxRef?.ui.setStatus(STATUS_KEY, `⏳ rate-limited (429) — pi retrying… · attempt ${attempt}`);
+    }
+  }
+
+  // Opportunistic: capture an accurate Retry-After on providers that surface the
+  // 429 as an HTTP response. (The OpenAI-SDK path never reaches here on a 429 — it
+  // throws first — so for those this stays undefined and we show attempt count.)
   pi.on("after_provider_response", (event, ctx) => {
     ctxRef = ctx;
     if (event.status === 429) {
@@ -98,30 +116,28 @@ export default function (pi: ExtensionAPI) {
     if (msg.role !== "assistant") return;
 
     if (msg.errorMessage && RATE_LIMIT_RE.test(msg.errorMessage)) {
-      const waitSec = pendingRetryAfter ?? 2 ** Math.min(rateLimitCount + 1, 5);
+      const waitSec = pendingRetryAfter;
       pendingRetryAfter = undefined;
-      // Alert once per rate-limit burst (not on every retry within it).
       if (!active) {
-        ctx.ui.notify(
-          `Rate limited (429) — pi will retry automatically in ~${Math.ceil(waitSec)}s`,
-          "info",
-        );
+        burstCount = 0; // start of a new burst
+        ctx.ui.notify("Rate limited (429) — pi will retry automatically", "info");
       }
-      showRateLimited(waitSec);
-    } else if (!msg.errorMessage) {
-      // A clean assistant message means the rate-limit wait resolved → clear.
-      clearIndicator();
+      burstCount += 1;
+      showRateLimited(waitSec, burstCount);
+    } else if (!msg.errorMessage && active) {
+      // A clean assistant message means pi got through the throttle.
+      showRecovered(burstCount);
     }
   });
 
   // Safety net: when the run fully settles (success or retries exhausted), never
-  // leave a stale countdown in the footer.
+  // leave a stale indicator in the footer.
   pi.on("agent_settled", (_event, ctx) => {
     ctxRef = ctx;
     clearIndicator();
   });
 
   pi.on("session_shutdown", () => {
-    clearCountdown();
+    clearTimers();
   });
 }
