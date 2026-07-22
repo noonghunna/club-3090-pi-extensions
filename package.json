@@ -1,0 +1,38 @@
+{
+  "name": "club-3090-pi-extensions",
+  "version": "0.1.0",
+  "description": "Pi coding-agent extensions for the club-3090 inference stack: observable zellij job execution, a bash transcript mirror, and more.",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "zellij",
+    "agent-tools",
+    "club-3090"
+  ],
+  "files": [
+    "extensions/",
+    "extension-manifest.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/noonghunna/club-3090-pi-extensions.git"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/zellij-job.ts",
+      "./extensions/mux-transcript.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}

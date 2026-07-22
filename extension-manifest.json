@@ -1,0 +1,15 @@
+{
+  "id": "club-3090-pi-extensions",
+  "name": "club-3090 Pi Extensions",
+  "version": "0.1.0",
+  "description": "Pi extensions for the club-3090 inference stack: observable zellij job execution and a bash transcript mirror.",
+  "tier": "community",
+  "requires": {
+    "platform": ">=0.80.0"
+  },
+  "provides": {
+    "tools": [
+      "zellij_job"
+    ]
+  }
+}
