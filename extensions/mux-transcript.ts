@@ -23,6 +23,7 @@ export default function (pi: ExtensionAPI) {
   let paneStarted = false;
   let surface: any = null;
   let mux: any = null;
+  let paneId: string | undefined; // zellij pane id of OUR mirror pane
 
   async function ensurePane() {
     if (paneStarted) return;
@@ -40,10 +41,13 @@ export default function (pi: ExtensionAPI) {
       } catch {
         /* pi-terminal-mux not resolvable from this extension — use zellij */
       }
-      execSync(
+      const out = execSync(
         `zellij action new-pane --name "${paneName}" -- bash -c 'tail -f --retry "${logFile}"'`,
-        { stdio: "ignore" },
-      );
+        { stdio: ["ignore", "pipe", "ignore"] },
+      ).toString();
+      // new-pane prints the created pane id (e.g. "terminal_28"); remember it so
+      // cleanup closes THIS pane, not whatever pane happens to be focused.
+      paneId = (out.trim().match(/terminal_\d+|plugin_\d+|\d+/) ?? [])[0];
     } catch {
       /* pane creation failed — transcript disabled, pi keeps working normally */
     }
@@ -86,8 +90,16 @@ export default function (pi: ExtensionAPI) {
   // Clean up the pane + log on shutdown.
   pi.on("session_shutdown", async () => {
     try {
-      if (surface && mux?.closeSurface) mux.closeSurface(surface);
-      else execSync(`zellij action close-pane 2>/dev/null || true`, { stdio: "ignore" });
+      if (surface && mux?.closeSurface) {
+        mux.closeSurface(surface);
+      } else if (paneId) {
+        // Close OUR mirror pane by id. A bare `close-pane` closes the *focused*
+        // pane, which on /resume //reload //new/quit was killing pi's own pane
+        // (or whichever pane the user was looking at) instead of the transcript.
+        execSync(`zellij action close-pane --pane-id ${paneId} 2>/dev/null || true`, { stdio: "ignore" });
+      }
+      // No paneId (capture failed) -> deliberately do nothing: leaking a harmless
+      // `tail -f` pane is far better than closing an unrelated focused pane.
     } catch {
       /* best effort */
     }
