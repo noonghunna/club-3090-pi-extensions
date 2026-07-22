@@ -24,7 +24,8 @@
   "pi": {
     "extensions": [
       "./extensions/zellij-job.ts",
-      "./extensions/mux-transcript.ts"
+      "./extensions/mux-transcript.ts",
+      "./extensions/qwen-quota.ts"
     ]
   },
   "peerDependencies": {

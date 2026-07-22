@@ -89,6 +89,17 @@ not re-executed, so there are no side effects.
 This one is always-on once installed. If you only want the opt-in `zellij_job`
 tool, disable `mux-transcript` with `pi config` (toggle the extension off).
 
+### `qwen-quota` — ModelScope Qwen quota in the statusline
+
+Passive statusline: after each provider response from a **ModelScope** `Qwen-Ambassador/*`
+model, it reads the `modelscope-ratelimit-model-month-requests-{remaining,limit}`
+response headers and shows the monthly quota in the statusline — e.g.
+`Qwen quota: 1,234/5,000 remaining (75.3% used)`.
+
+It's a no-op for any other model/provider (only fires when those ratelimit headers
+are present), so it's safe to leave on everywhere. Handy for keeping an eye on
+hosted-Qwen rate limits during long bench runs.
+
 ## Adding a new extension
 
 1. Drop a `.ts` file in `extensions/` exporting `default function (pi: ExtensionAPI) { … }`.
