@@ -16,6 +16,10 @@ pi install git:github.com/noonghunna/club-3090-pi-extensions
 
 Then restart Pi or run `/reload`.
 
+## Guides
+
+- **[Track your Qwen Ambassador quota in pi](docs/qwen-ambassador-quota.md)** — set up the `Qwen-Ambassador` models on ModelScope and get a live monthly-quota meter (plus graceful 429 handling) in your pi statusline.
+
 ## Requirements
 
 - Linux / Unix-like
