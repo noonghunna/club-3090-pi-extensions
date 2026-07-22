@@ -3,24 +3,25 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 /**
  * graceful-429 — make provider rate-limiting (HTTP 429) visible instead of scary.
  *
- * pi already retries transient errors automatically (settings.json `retry.*`).
- * This extension does NOT change that — it surfaces it in the footer statusline:
- * a live "retrying · attempt N" indicator while pi is throttled, plus a one-time
- * notification, and a brief "✓ cleared after N retries" when pi gets through.
+ * pi already retries transient errors automatically (settings.json `retry.*`:
+ * retry.enabled, retry.maxRetries, retry.baseDelayMs). This extension does NOT
+ * change that — it surfaces it in the footer statusline as a live
+ * "retrying… · attempt N" indicator that increments on every retry, plus a
+ * one-time notification and a brief "✓ cleared after N retries" on recovery.
  *
- * WHY NO FAKE COUNTDOWN: an earlier version estimated pi's backoff and ticked a
- * countdown, but every 429 re-fires `message_end` and reset it — so it sat at a
- * static "~4s" the whole time pi was retrying. For OpenAI-SDK providers
- * (dashscope, openai, openrouter, …) there's also no Retry-After to read, because
- * the SDK throws an APIError on the non-2xx response *before* pi's onResponse
- * runs. So we only show a real countdown when a transport actually surfaces
- * Retry-After (raw-fetch providers); otherwise we show the live attempt count,
- * which genuinely progresses instead of pretending to a timer we don't have.
+ * COUNTING RETRIES — use `agent_end`, not `message_end`:
+ * pi's retry is at the AGENT-SESSION level (retry.maxRetries). Each retry is a
+ * fresh agent run, so `agent_end` fires once per attempt and its `messages`
+ * carry the failed assistant message (with the 429 `errorMessage`). `message_end`
+ * does NOT reliably re-fire for each internal retry, so counting it leaves the
+ * indicator stuck at "attempt 1". Counting `agent_end` runs that end in a 429
+ * increments correctly on every retry.
  *
- * Detection hooks `message_end` and matches an assistant message whose
- * `errorMessage` carries a 429 / rate-limit signature (the reliable hook for all
- * providers). `after_provider_response` is used only to opportunistically capture
- * an accurate Retry-After where the transport surfaces it.
+ * For OpenAI-SDK providers (dashscope, openai, openrouter, …) there's no
+ * Retry-After to read (the SDK throws an APIError on the non-2xx response before
+ * pi's onResponse runs), so we show the attempt count; where a transport DOES
+ * surface Retry-After (raw-fetch providers, via after_provider_response) we show
+ * a real countdown instead.
  */
 export default function (pi: ExtensionAPI) {
   const STATUS_KEY = "graceful-429";
@@ -29,7 +30,7 @@ export default function (pi: ExtensionAPI) {
   let ctxRef: ExtensionContext | undefined; // latest ctx, for timer callbacks
   let countdownTimer: ReturnType<typeof setInterval> | undefined;
   let clearTimer: ReturnType<typeof setTimeout> | undefined;
-  let burstCount = 0; // 429s in the current rate-limit burst
+  let burstCount = 0; // 429 attempts in the current rate-limit burst
   let active = false; // currently showing a rate-limit indicator
   let pendingRetryAfter: number | undefined; // accurate Retry-After when a transport surfaced it
 
@@ -90,11 +91,18 @@ export default function (pi: ExtensionAPI) {
         }
       }, 1000);
     } else {
-      // No reliable Retry-After (e.g. dashscope / OpenAI-SDK). Don't fake a timer
-      // that just resets on every 429 — show the attempt count, which actually
-      // progresses as pi retries.
+      // No reliable Retry-After (e.g. dashscope / OpenAI-SDK). Don't fake a timer —
+      // show the attempt count, which increments on every retry.
       ctxRef?.ui.setStatus(STATUS_KEY, `⏳ rate-limited (429) — pi retrying… · attempt ${attempt}`);
     }
+  }
+
+  // Does this agent run end in a 429? (assistant message carrying a rate-limit error)
+  function runEndedIn429(messages: unknown[]): boolean {
+    return messages.some((m) => {
+      const msg = m as { role?: string; errorMessage?: string };
+      return msg.role === "assistant" && !!msg.errorMessage && RATE_LIMIT_RE.test(msg.errorMessage);
+    });
   }
 
   // Opportunistic: capture an accurate Retry-After on providers that surface the
@@ -109,23 +117,20 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // Primary detection: the 429 surfaces as the assistant message's errorMessage.
-  pi.on("message_end", (event, ctx) => {
+  // Primary: count retries via agent_end (fires once per agent run / retry attempt).
+  pi.on("agent_end", (event, ctx) => {
     ctxRef = ctx;
-    const msg = event.message as { role?: string; errorMessage?: string };
-    if (msg.role !== "assistant") return;
-
-    if (msg.errorMessage && RATE_LIMIT_RE.test(msg.errorMessage)) {
+    if (runEndedIn429(event.messages)) {
       const waitSec = pendingRetryAfter;
       pendingRetryAfter = undefined;
       if (!active) {
         burstCount = 0; // start of a new burst
-        ctx.ui.notify("Rate limited (429) — pi will retry automatically", "info");
+        ctx.ui.notify("Rate limited (429) — pi is retrying…", "info");
       }
       burstCount += 1;
       showRateLimited(waitSec, burstCount);
-    } else if (!msg.errorMessage && active) {
-      // A clean assistant message means pi got through the throttle.
+    } else if (active) {
+      // A clean agent run ended → pi got through the throttle.
       showRecovered(burstCount);
     }
   });
