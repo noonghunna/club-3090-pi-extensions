@@ -35,9 +35,50 @@ Both share a 262K-token context window and full reasoning support. The provider 
 
 ---
 
-## Step 1 — Register the Qwen Ambassador models in pi
+## Step 1 — Add the Qwen Ambassador models to pi
 
-pi doesn't ship the ModelScope endpoint out of the box, so we tell it about the `Qwen-Ambassador` models with a tiny provider extension. Create `~/.pi/agent/extensions/qwen-ambassador.ts`:
+pi doesn't ship the ModelScope endpoint out of the box, so we register the `Qwen-Ambassador` models ourselves. Two ways — pick whichever you prefer.
+
+### Option A — Edit `~/.pi/agent/models.json` (recommended)
+
+pi reads custom providers from `~/.pi/agent/models.json`. Add a `modelscope` entry under `providers` (if you already have other providers there, just drop the `"modelscope": { … }` block in alongside them):
+
+```json
+{
+  "providers": {
+    "modelscope": {
+      "baseUrl": "https://api-inference.modelscope.ai/v1",
+      "api": "openai-completions",
+      "apiKey": "$MODELSCOPE_API_KEY",
+      "compat": {
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": true,
+        "thinkingFormat": "qwen"
+      },
+      "models": [
+        {
+          "id": "Qwen-Ambassador/Qwen3.7-Max",
+          "name": "Qwen3.7-Max (Qwen Ambassador)",
+          "contextWindow": 262144,
+          "reasoning": true
+        },
+        {
+          "id": "Qwen-Ambassador/Qwen3.7-Plus",
+          "name": "Qwen3.7-Plus (Qwen Ambassador)",
+          "contextWindow": 262144,
+          "reasoning": true
+        }
+      ]
+    }
+  }
+}
+```
+
+`"$MODELSCOPE_API_KEY"` tells pi to pull the key from your environment, so it never sits in the file. (Prefer to paste the key literally here instead? That works too.)
+
+### Option B — Register via an extension
+
+Prefer code, or want to version-control your provider setup? Drop this in `~/.pi/agent/extensions/qwen-ambassador.ts` instead — same registration, just programmatic:
 
 ```typescript
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -77,7 +118,9 @@ export default function (pi: ExtensionAPI) {
 }
 ```
 
-Then export your key (add it to your shell profile so it persists):
+### Then: set your key and pick a model
+
+Whichever option you chose, export your key (add it to your shell profile so it persists):
 
 ```bash
 export MODELSCOPE_API_KEY="ms-…your-ambassador-key…"
