@@ -60,13 +60,29 @@ pi reads custom providers from `~/.pi/agent/models.json`. Add a `modelscope` ent
           "id": "Qwen-Ambassador/Qwen3.7-Max",
           "name": "Qwen3.7-Max (Qwen Ambassador)",
           "contextWindow": 262144,
-          "reasoning": true
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": null,
+            "minimal": "low",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "high"
+          }
         },
         {
           "id": "Qwen-Ambassador/Qwen3.7-Plus",
           "name": "Qwen3.7-Plus (Qwen Ambassador)",
           "contextWindow": 262144,
-          "reasoning": true
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": null,
+            "minimal": "low",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "high"
+          }
         }
       ]
     }
@@ -75,6 +91,8 @@ pi reads custom providers from `~/.pi/agent/models.json`. Add a `modelscope` ent
 ```
 
 `"$MODELSCOPE_API_KEY"` tells pi to pull the key from your environment, so it never sits in the file. (Prefer to paste the key literally here instead? That works too.)
+
+The `thinkingLevelMap` tells pi how to translate its thinking levels (`off` / `minimal` / `low` / `medium` / `high` / `xhigh`) into Qwen's reasoning-effort values, so the `/think` command and thinking-level control behave as expected. `"off": null` means thinking is fully disabled at that level.
 
 ### Option B — Register via an extension
 
@@ -103,6 +121,14 @@ export default function (pi: ExtensionAPI) {
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 262144,
         maxTokens: 32768,
+        thinkingLevelMap: {
+          off: null,
+          minimal: "low",
+          low: "low",
+          medium: "medium",
+          high: "high",
+          xhigh: "high",
+        },
       },
       {
         id: "Qwen-Ambassador/Qwen3.7-Plus",
@@ -112,6 +138,14 @@ export default function (pi: ExtensionAPI) {
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 262144,
         maxTokens: 32768,
+        thinkingLevelMap: {
+          off: null,
+          minimal: "low",
+          low: "low",
+          medium: "medium",
+          high: "high",
+          xhigh: "high",
+        },
       },
     ],
   });
