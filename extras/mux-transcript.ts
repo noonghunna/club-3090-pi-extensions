@@ -15,7 +15,42 @@ import { join } from "node:path";
  *
  * Uses pi-terminal-mux when it resolves; falls back to raw `zellij action`
  * (pi runs inside zellij here, so the fallback always works).
+ *
+ * Zellij placement: the mirror pane is created in PI'S OWN TAB, resolved by
+ * querying `list-panes --json --tab` for the tab containing pi's pane
+ * (ZELLIJ_PANE_ID) and passing `--tab-id`. We deliberately do NOT use
+ * `new-pane --in-place`: that anchors to the *focused* pane, not ZELLIJ_PANE_ID,
+ * so it drops the mirror into whatever tab happens to be focused.
  */
+
+/** Find the tab_id of a given zellij pane by walking `list-panes --json --tab`. */
+function findTabForPane(listing: string, paneId: string): string | undefined {
+  try {
+    const parsed = JSON.parse(listing);
+    const target = String(paneId).replace(/^terminal_/, "");
+    const stack: unknown[] = [parsed];
+    while (stack.length) {
+      const node = stack.pop();
+      if (Array.isArray(node)) {
+        stack.push(...node);
+        continue;
+      }
+      if (node && typeof node === "object") {
+        const rec = node as Record<string, unknown>;
+        const pid = rec.pane_id ?? rec.id;
+        const tid = rec.tab_id;
+        if (pid !== undefined && tid !== undefined && String(pid).replace(/^terminal_/, "") === target) {
+          return String(tid);
+        }
+        stack.push(...Object.values(rec));
+      }
+    }
+  } catch {
+    /* ignore parse errors — caller falls back to --in-place */
+  }
+  return undefined;
+}
+
 export default function (pi: ExtensionAPI) {
   const id = process.pid;
   const logFile = join(tmpdir(), `pi-mux-transcript-${id}.log`);
@@ -36,8 +71,20 @@ export default function (pi: ExtensionAPI) {
       // unexpected. `new-pane --in-place` anchors to pi's pane (ZELLIJ_PANE_ID) and
       // splits it, so the mirror always lives beside pi instead of spawning a tab.
       if (process.env.ZELLIJ_PANE_ID) {
+        // Resolve pi's tab so the mirror lands beside pi regardless of which tab
+        // is focused. Fall back to --in-place if the lookup fails.
+        let target = "--in-place";
+        try {
+          const listing = execSync("zellij action list-panes --json --tab", {
+            stdio: ["ignore", "pipe", "ignore"],
+          }).toString();
+          const tabId = findTabForPane(listing, process.env.ZELLIJ_PANE_ID);
+          if (tabId) target = `--tab-id ${tabId}`;
+        } catch {
+          /* keep --in-place fallback */
+        }
         const zellijOut = execSync(
-          `zellij action new-pane --in-place --name "${paneName}" -- bash -c 'tail -f --retry "${logFile}"'`,
+          `zellij action new-pane ${target} --name "${paneName}" -- bash -c 'tail -f --retry "${logFile}"'`,
           { stdio: ["ignore", "pipe", "ignore"] },
         ).toString();
         // new-pane prints the created pane id (e.g. "terminal_28"); remember it so

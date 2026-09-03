@@ -22,10 +22,31 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
  * pi's onResponse runs), so we show the attempt count; where a transport DOES
  * surface Retry-After (raw-fetch providers, via after_provider_response) we show
  * a real countdown instead.
+ *
+ * QUOTA vs THROTTLE — the distinction that matters (fixed 2026-07-29):
+ * pi only retries TRANSIENT errors. Its classifier (pi-ai `retry.js`
+ * `isRetryableAssistantError`) checks a NON-RETRYABLE quota/billing pattern FIRST
+ * (`insufficient_quota`, `quota exceeded`, `out of budget`, `billing`, usage-limit
+ * wording) and fails fast on those — no backoff, no retry. Only if that misses does
+ * it treat `429`/`rate limit`/`overloaded`/5xx as retryable. The first version of
+ * this extension lumped `quota` in with the retryable pattern, so for a dashscope
+ * `insufficient_quota` 429 it showed "pi retrying… attempt N" while pi had actually
+ * given up — a misleading "retrying" state that read as a stall. We now mirror pi's
+ * precedence: quota/billing exhaustion → "⛔ quota exhausted — pi will NOT retry";
+ * transient throttle → "⏳ retrying… attempt N". (`auto_retry_start`/`_end` would be
+ * the authoritative signal but are NOT exposed to extensions, and `agent_end` carries
+ * no `willRetry`, so we replicate the classifier.)
  */
 export default function (pi: ExtensionAPI) {
   const STATUS_KEY = "graceful-429";
-  const RATE_LIMIT_RE = /429|rate.?limit|too many requests|quota/i;
+  // Transient throttles pi WILL retry. NOTE: no `quota` here — quota/billing
+  // exhaustion is non-retryable and lives in NON_RETRYABLE_RE below.
+  const RATE_LIMIT_RE = /429|rate.?limit|too many requests|overloaded|503|529/i;
+  // Mirror of pi-ai's NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN — checked FIRST,
+  // exactly like pi does. These fail fast (pi does NOT retry), so we must never
+  // label them "retrying".
+  const NON_RETRYABLE_RE =
+    /insufficient_quota|quota exceeded|out of budget|billing|usage limit|available balance|GoUsageLimitError|FreeUsageLimitError/i;
 
   let ctxRef: ExtensionContext | undefined; // latest ctx, for timer callbacks
   let countdownTimer: ReturnType<typeof setInterval> | undefined;
@@ -97,12 +118,33 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  // Does this agent run end in a 429? (assistant message carrying a rate-limit error)
-  function runEndedIn429(messages: unknown[]): boolean {
-    return messages.some((m) => {
+  // Classify how an agent run ended: a non-retryable quota/billing exhaustion,
+  // a transient throttle pi will retry, or neither. Quota is checked FIRST to
+  // match pi's own precedence (a message can contain both "429" and
+  // "insufficient_quota" — dashscope's does — and quota must win).
+  function classifyEnd(messages: unknown[]): "quota" | "transient" | null {
+    for (const m of messages) {
       const msg = m as { role?: string; errorMessage?: string };
-      return msg.role === "assistant" && !!msg.errorMessage && RATE_LIMIT_RE.test(msg.errorMessage);
-    });
+      if (msg.role !== "assistant" || !msg.errorMessage) continue;
+      if (NON_RETRYABLE_RE.test(msg.errorMessage)) return "quota";
+      if (RATE_LIMIT_RE.test(msg.errorMessage)) return "transient";
+    }
+    return null;
+  }
+
+  // Quota/billing exhaustion: pi has given up (fail-fast). Say so plainly instead
+  // of faking a retry countdown. Left up until agent_settled clears it.
+  function showQuotaExhausted() {
+    clearTimers();
+    active = true;
+    ctxRef?.ui.setStatus(
+      STATUS_KEY,
+      "⛔ quota exhausted (429) — pi will NOT retry · increase provider quota",
+    );
+    ctxRef?.ui.notify(
+      "Quota exhausted (429) — pi will not retry this. Increase your provider quota or wait for the limit to reset.",
+      "warning",
+    );
   }
 
   // Opportunistic: capture an accurate Retry-After on providers that surface the
@@ -120,7 +162,12 @@ export default function (pi: ExtensionAPI) {
   // Primary: count retries via agent_end (fires once per agent run / retry attempt).
   pi.on("agent_end", (event, ctx) => {
     ctxRef = ctx;
-    if (runEndedIn429(event.messages)) {
+    const kind = classifyEnd(event.messages);
+    if (kind === "quota") {
+      // Non-retryable: pi fails fast. Never show "retrying" here.
+      burstCount = 0;
+      showQuotaExhausted();
+    } else if (kind === "transient") {
       const waitSec = pendingRetryAfter;
       pendingRetryAfter = undefined;
       if (!active) {

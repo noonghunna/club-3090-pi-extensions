@@ -1,158 +1,239 @@
-# club-3090-pi-extensions
+# pi-omp-extensions
 
-[Pi coding-agent](https://pi.dev) extensions used on the **club-3090** local-LLM
-inference stack (2× RTX 3090, models served via vLLM/SGLang behind LiteLLM). The
-rig runs Pi inside [zellij](https://zellij.dev), so these extensions make the
-agent's shell work **observable in zellij panes**.
+A **standalone statusline extension** for [pi](https://pi.dev) and
+[oh-my-pi (omp)](https://github.com/earendil-works/pi-mono) coding agents that
+shows your **ModelScope magicube balance** — the account-level credit that
+ModelScope's api-inference now bills per request (the old per-model monthly
+request quotas and their `modelscope-ratelimit-*` headers are deprecated) —
+plus the **per-request rate of the model you're using**, derived from your own
+observed deductions:
 
-One Pi package, many extensions — each lives in `extensions/` and is registered
-in `package.json`'s `pi.extensions` array.
+```
+Magicubes: 6,242 available · 0.2/req
+```
+
+Works with **Qwen Ambassador** models (`Qwen-Ambassador/*`) and any other
+ModelScope api-inference model (e.g. `deepseek-ai/DeepSeek-V4-Pro-0813`).
+
+---
 
 ## Install
 
+The package installs **only the `qwen-quota` extension** — nothing else is
+bundled. (A few optional extras live in [`extras/`](#extras-opt-in) and are
+never installed automatically.)
+
+### pi
+
 ```bash
-pi install git:github.com/noonghunna/club-3090-pi-extensions
+pi install git:github.com/noonghunna/pi-omp-extensions
 ```
 
-Then restart Pi or run `/reload`.
+or manually:
 
-## Guides
+```bash
+mkdir -p ~/.pi/agent/extensions
+cp extensions/qwen-quota/pi/qwen-quota.ts ~/.pi/agent/extensions/
+```
 
-- **[Track your Qwen Ambassador quota in pi](docs/qwen-ambassador-quota.md)** — set up the `Qwen-Ambassador` models on ModelScope and get a live monthly-quota meter (plus graceful 429 handling) in your pi statusline.
+### omp
+
+```bash
+mkdir -p ~/.omp/agent/extensions
+cp extensions/qwen-quota/omp/qwen-quota.ts ~/.omp/agent/extensions/
+```
+
+### Both at once
+
+```bash
+./install.sh          # adds --extras to also install the optional pi extensions
+```
+
+Then restart the agent (or `/reload`).
+
+---
+
+## Setup: the ModelScope (Qwen Ambassador) provider
+
+The extension reads your ModelScope API token from the configured
+`modelscope` provider — it never asks for or hardcodes the key itself.
+
+1. **Get a token**: [modelscope.cn](https://modelscope.cn) → account →
+   *Access Tokens* → create/copy an `ms-…` token. Qwen Ambassador access to
+   the `Qwen-Ambassador/*` models rides on this same token.
+2. **Export it** (recommended): `export MODELSCOPE_API_KEY=ms-…`
+
+### omp — `~/.omp/agent/models.yml`
+
+```yaml
+providers:
+  modelscope:
+    baseUrl: https://api-inference.modelscope.ai/v1
+    api: openai-completions
+    apiKey: $MODELSCOPE_API_KEY        # or paste the ms-… literal
+    compat:
+      supportsDeveloperRole: false
+      supportsReasoningEffort: true
+      thinkingFormat: qwen
+      qwenTemplateReasoningEffort: false
+    models:
+      - id: Qwen-Ambassador/Qwen3.7-Max
+        name: Qwen3.7-Max (ModelScope)
+        contextWindow: 262144
+        maxTokens: 65536
+        reasoning: true
+        supportsTools: true
+        thinkingLevelMap:
+          off: null
+          minimal: low
+          low: low
+          medium: medium
+          high: high
+          xhigh: high
+      # …repeat per model. Any id from https://api-inference.modelscope.ai/v1/models works, e.g.:
+      - id: deepseek-ai/DeepSeek-V4-Pro-0813
+        name: DeepSeek-V4-Pro-0813 (ModelScope)
+        contextWindow: 1048576
+        maxTokens: 393216
+        reasoning: true
+        supportsTools: true
+        thinkingLevelMap:
+          off: null
+          minimal: low
+          low: low
+          medium: medium
+          high: high
+          xhigh: high
+```
+
+### pi — `~/.pi/agent/models.json`
+
+```json
+{
+  "providers": {
+    "modelscope": {
+      "baseUrl": "https://api-inference.modelscope.ai/v1",
+      "api": "openai-completions",
+      "apiKey": "$MODELSCOPE_API_KEY",
+      "compat": {
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": true,
+        "thinkingFormat": "qwen"
+      },
+      "models": [
+        {
+          "id": "Qwen-Ambassador/Qwen3.7-Max",
+          "name": "Qwen3.7-Max (ModelScope)",
+          "contextWindow": 262144,
+          "maxTokens": 65536,
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": null,
+            "minimal": "low",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "high"
+          }
+        }
+      ]
+    }
+  }
+}
+```
+
+> **Tip (pi):** if another configured provider (huggingface, nvidia, …) also
+> carries the same model id, a bare `--model <id>` is ambiguous — use the
+> qualified form: `--model modelscope/deepseek-ai/DeepSeek-V4-Pro-0813`.
+
+The `compat` block matters: `thinkingFormat: qwen` sends the DashScope-style
+top-level `enable_thinking` switch (with `off` actually disabling thinking),
+and `supportsReasoningEffort` forwards `reasoning_effort`. Both are accepted by
+ModelScope's gateway for Qwen and DeepSeek models.
+
+---
+
+## What you get
+
+| State | Statusline |
+|---|---|
+| ModelScope model selected, balance known | `Magicubes: 6,242 available` |
+| Mid-spend (some credits frozen) | `Magicubes: 6,247.4 available / 6,247.6 total (0.2 frozen)` |
+| Rate derived for the selected model | `Magicubes: 6,242 available · 0.2/req` |
+| Non-ModelScope model selected | *(status entry cleared)* |
+
+Behavior:
+
+- **Balance** is fetched from `/openapi/v1/magicubes/balance` when a
+  ModelScope model becomes active and refreshed after each ModelScope response
+  (throttled to one call / 15 s). On API errors the last known value stays on
+  screen.
+- **Rate is derived from your own deductions.** ModelScope publishes tier
+  prices but **no model→tier mapping** anywhere (models list, response
+  headers, and the rates API are all tier-only). So the extension snapshots
+  the transactions ledger (`/openapi/v1/magicubes/transactions`) when a model
+  is selected, diffs it after the model's first response, and if exactly one
+  tier moved, the rate is `Δamount / Δcount` — the *actually applied* price.
+  It is derived **once per model selection**, cached until you switch models,
+  and never re-derived every turn.
+  - If several tiers moved in the same window (another session sharing your
+    token spent elsewhere), the window is poisoned; the extension re-baselines
+    and retries on the next response, giving up after two attempts rather than
+    showing a wrong number.
+  - Confirmation lag: a just-finished request may not be in the ledger yet;
+    the retry on the next response resolves that.
+- The rate cache is in-memory (per agent process) and deliberately not
+  persisted — ModelScope can reprice tiers, and re-derivation costs at most
+  two small ledger reads.
+
+### Magicube pricing (api_inference, per request)
+
+| Tier | Price |
+|---|---|
+| discount | 0.2 |
+| lite | 0.5 |
+| standard | 1 |
+| ultra | 2 |
+
+Observed mapping (derived with this extension; can change without notice):
+`Qwen-Ambassador/Qwen3.7-Plus` → discount, `Qwen-Ambassador/Qwen3.8-Max` →
+lite. Your balance and rate are always *your* numbers — the
+`/openapi/v1/magicubes/{balance,transactions,spend/rates}` endpoints accept
+the same `Authorization: Bearer <token>` as the inference API.
+
+---
+
+## Extras (opt-in, pi only)
+
+Not installed by the package — copy what you want manually:
+
+```bash
+cp extras/<name>.ts ~/.pi/agent/extensions/
+```
+
+| Extension | What it does |
+|---|---|
+| `graceful-429.ts` | Live "retrying in ~Ns · #N" statusline countdown when a provider returns HTTP 429 (surfaces pi's built-in retry; changes nothing). |
+| `mux-transcript.ts` | Mirrors every bash tool call + output into a persistent zellij/tmux pane beside the conversation (read-only). |
+| `zellij-job.ts` | The `zellij_job` tool: run long/interactive commands in visible zellij panes you can `tail`/`wait`/`send`/`interrupt` — a port of [pi-tmux-job](https://github.com/kevinb361/pi-tmux-job) (MIT). |
+| `thinking-level-status.ts` | Shows the current thinking level (e.g. `thinking: high`) in the statusline. |
 
 ## Requirements
 
-- Linux / Unix-like
-- [zellij](https://zellij.dev) 0.44+ — and **Pi must be running inside a zellij session**
-- Node.js 24+
-- Pi coding agent 0.80+
+- pi (`@earendil-works/pi-coding-agent`) **or** oh-my-pi (`omp`), recent
+  versions (extension API with `modelRegistry` + `model_select`)
+- A ModelScope account + API token; `Qwen-Ambassador/*` access for the
+  Ambassador models
 
-## Extensions
+## Adding your own extensions
 
-### `zellij_job` — observable long-lived command execution
-
-A Pi-owned terminal-multiplexer job runner for zellij: run long or interactive
-commands in **visible panes** you can watch, tail, interrupt, or take over —
-instead of opaque background bash.
-
-> A zellij port of [`kevinb361/pi-tmux-job`](https://github.com/kevinb361/pi-tmux-job)
-> (MIT) — same tool shape and runner design, driving `zellij action` and tracking
-> jobs in a `~/.pi/agent/zellij-jobs/jobs.json` registry (zellij has no per-pane
-> user-options like tmux).
-
-Use normal `bash` for quick commands. Use `zellij_job` for tests, builds, dev
-servers, benchmarks, log tails, migrations — anything where visibility or
-persistence matters.
-
-| Action      | Purpose                                                        |
-| ----------- | -------------------------------------------------------------- |
-| `start`     | Start a command in a Pi-owned pane (requires `name`, `command`) |
-| `list`      | List open Pi-owned jobs in this session                        |
-| `status`    | Job state + recent output                                      |
-| `tail`      | Capture recent output (from the runner's `output.log`)         |
-| `wait`      | Wait for the command to finish, bounded timeout                |
-| `send`      | Send literal input (requires `text`), optionally press Enter   |
-| `interrupt` | Send Ctrl-C                                                    |
-| `close`     | Close a completed pane; running jobs require `force=true`      |
-
-Jobs are addressed by **name**, generated **id**, or zellij **pane id**
-(`terminal_N`). Each job keeps persistent files under
-`~/.pi/agent/zellij-jobs/<id>/` (`command.sh`, `runner.sh`, `output.log`,
-`state`, `exit-code`, `pid`).
-
-**Example prompts**
-
-```text
-Run rebench-full.sh in a visible zellij pane named rebench, wait for it, and show the result.
-```
-
-```text
-Start the cloud quality eval in a pane named cloud-eval and tail the last 50 lines.
-```
-
-```text
-List my Pi-owned zellij jobs and close the completed ones.
-```
-
-**Behavior**
-
-- Panes are created with `zellij action new-pane --name … --cwd … -- bash runner.sh`.
-- The runner tees all output to `output.log` and writes `state`/`exit-code`, so
-  `tail`/`status`/`wait` work from files (reliable, full output — not just the
-  viewport).
-- `send`/`interrupt` target the pane by `--pane-id` (`write-chars` / `write 3`).
-- Output returned to the model is capped at 50 KB / 2000 lines.
-
-**Pane safety policies**
-
-Closing the wrong pane is destructive (it can kill your shell or Pi itself), so
-`zellij_job` is conservative about the pane lifecycle:
-
-- **ID-targeted, never focus-based.** Every pane mutation uses
-  `zellij action <x> --pane-id <id>`. `close` runs `close-pane --pane-id <id>` —
-  it never does focus-then-close, which races and can destroy whatever happens to
-  be focused.
-- **Existence-checked + idempotent close.** `close` confirms the pane still
-  exists (`list-panes`) first; an already-gone pane is a no-op — not an error and
-  not a stray close.
-- **Session-scoped.** Each job records the zellij session it was created in. Pane
-  ids reset on a zellij restart and may be reused, so for a job from another
-  session `send`/`interrupt` refuse and `close` only drops the stale registry
-  entry — it never touches a possibly-reused pane.
-- **Running-job protection.** `close` refuses a launching/running job unless
-  `force=true` (then it SIGTERMs the process tree first).
-- **Open throttle.** At most 25 Pi-owned panes per session.
-- **`wait` never auto-closes.** Hitting the wait timeout returns `timedOut: true`
-  but leaves the pane open; closing is always an explicit `close`.
-
-### `mux-transcript` — mirror every bash execution into a live pane
-
-Passive visibility: keeps one persistent pane (`pi-mux-<pid>`) running
-`tail -f` on a transcript log, and appends `$ <command>` on each `bash` tool call
-plus the (truncated) output on each result. **Read-only mirror** — commands are
-not re-executed, so there are no side effects.
-
-In zellij the mirror pane is created with `new-pane --in-place`, anchored to pi's
-own pane (`ZELLIJ_PANE_ID`), so it always splits pi's tab and stays beside the
-conversation — it never spawns a separate tab. (pi-terminal-mux's default
-placement opens a *new tab* whenever pi's pane is too small to split, which is
-what this avoids.)
-
-This one is always-on once installed. If you only want the opt-in `zellij_job`
-tool, disable `mux-transcript` with `pi config` (toggle the extension off).
-
-### `qwen-quota` — ModelScope Qwen quota in the statusline
-
-Passive statusline: after each provider response from a **ModelScope** `Qwen-Ambassador/*`
-model, it reads the `modelscope-ratelimit-model-month-requests-{remaining,limit}`
-response headers and shows the monthly quota in the statusline — e.g.
-`Qwen quota: 1,234/5,000 remaining (75.3% used)`.
-
-It's a no-op for any other model/provider (only fires when those ratelimit headers
-are present), so it's safe to leave on everywhere. Handy for keeping an eye on
-hosted-Qwen rate limits during long bench runs.
-
-### `graceful-429` — visible 429 rate-limit countdown
-
-Passive UX layer over pi's built-in transient-error retry (settings `retry.*`): when a
-provider returns **HTTP 429**, it shows a live countdown in the footer statusline —
-`⏳ rate-limited (429) — retrying in ~Ns · #N this session` — plus a one-time notification,
-and clears it when the retry lands (with a safety-net clear on `agent_end`). It reads the
-server's `Retry-After` for an accurate countdown, falling back to pi's backoff estimate.
-
-It doesn't change the retry behavior itself — tune that in `settings.json`
-(`retry.maxRetries`, `retry.baseDelayMs`, `retry.provider.maxRetryDelayMs`). Generic —
-fires on any provider's 429, so a throttled turn reads as "waiting on the rate limit"
-rather than "hung."
-
-## Adding a new extension
-
-1. Drop a `.ts` file in `extensions/` exporting `default function (pi: ExtensionAPI) { … }`.
-2. Add its path to `pi.extensions` in `package.json`.
-3. If it registers a tool, list the tool under `provides.tools` in `extension-manifest.json`.
-4. Document it above.
+1. Drop a `.ts` file exporting `default function (pi: ExtensionAPI) { … }`
+   into the agent's `extensions/` directory (or into
+   `extensions/qwen-quota/{pi,omp}` here if it belongs to the package).
+2. For packaged pi extensions, add the path to `pi.extensions` in
+   `package.json` and document it.
 
 ## License
 
-MIT — see [LICENSE](./LICENSE). `extensions/zellij-job.ts` is a port of
+MIT — see [LICENSE](./LICENSE). `extras/zellij-job.ts` is a port of
 `kevinb361/pi-tmux-job` (Copyright (c) 2026 Kevin Blalock, MIT).
